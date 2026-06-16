@@ -228,154 +228,294 @@ function UniNotices({ onGo }) {
 // ---- Campus Geofence (university side — alert console moved to Super Admin) ----
 function UniGeofence({ onGo }) {
   const [vertices, setVertices] = useState([]);
+  const [zones, setZones] = useState([]);
+  const [selectedZone, setSelectedZone] = useState(null);
+  const [zoneName, setZoneName] = useState('');
+  const [zoneDesc, setZoneDesc] = useState('');
   const [drawMode, setDrawMode] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [recentAlerts, setRecentAlerts] = useState([]);
-  const [geoInfo, setGeoInfo] = useState(null);
+  const [mapError, setMapError] = useState(null);
+
+  const mapDivRef = useRef(null);
+  const leafletMapRef = useRef(null);
+  const polygonRef = useRef(null);
+  const markersRef = useRef([]);
+  const drawModeRef = useRef(false);
+
+  const loadZones = () => {
+    AnchorAPI.apiGet('/v1/admin/campus-zones')
+      .then(r => setZones(Array.isArray(r) ? r : []))
+      .catch(() => {});
+  };
 
   useEffect(() => {
-    AnchorAPI.apiGet('/v1/admin/geofence')
-      .then(r => {
-        if (Array.isArray(r.vertices) && r.vertices.length >= 3) {
-          setVertices(r.vertices);
-          setGeoInfo({ updated_at: r.updated_at, vertex_count: r.vertices.length });
-        }
-      }).catch(() => {});
+    loadZones();
     AnchorAPI.apiGet('/v1/admin/alerts?state=active&limit=5')
       .then(r => setRecentAlerts(r.items ?? []))
       .catch(() => {});
   }, []);
 
-  const handleSvgClick = (e) => {
-    if (!drawMode) return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    const x = Math.round(((e.clientX - rect.left) / rect.width) * 400);
-    const y = Math.round(((e.clientY - rect.top) / rect.height) * 200);
-    setVertices(v => [...v, [x, y]]);
+  useEffect(() => { drawModeRef.current = drawMode; }, [drawMode]);
+
+  // Init Leaflet map once
+  useEffect(() => {
+    if (!mapDivRef.current || leafletMapRef.current) return;
+    if (!window.L) { setMapError('Map library failed to load. Please refresh the page.'); return; }
+    try {
+      const map = window.L.map(mapDivRef.current, { zoomControl: true }).setView([23.7450, 90.3718], 15);
+      window.L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '© OpenStreetMap contributors',
+        maxZoom: 19,
+      }).addTo(map);
+      leafletMapRef.current = map;
+      setTimeout(() => map.invalidateSize(), 100);
+      map.on('click', (e) => {
+        if (!drawModeRef.current) return;
+        const { lat, lng } = e.latlng;
+        setVertices(v => [...v, [parseFloat(lat.toFixed(6)), parseFloat(lng.toFixed(6))]]);
+      });
+    } catch (err) {
+      setMapError('Map failed to initialise: ' + (err.message || 'unknown error'));
+    }
+    return () => {
+      if (leafletMapRef.current) { leafletMapRef.current.remove(); leafletMapRef.current = null; }
+      polygonRef.current = null;
+      markersRef.current = [];
+    };
+  }, []);
+
+  // Redraw polygon + vertex markers when vertices change
+  useEffect(() => {
+    const map = leafletMapRef.current;
+    if (!map || !window.L) return;
+    if (polygonRef.current) { polygonRef.current.remove(); polygonRef.current = null; }
+    markersRef.current.forEach(m => m.remove());
+    markersRef.current = [];
+    if (vertices.length >= 2) {
+      polygonRef.current = window.L.polygon(vertices, {
+        color: '#4A6B5C', fillColor: '#4A6B5C', fillOpacity: 0.15, weight: 2, dashArray: '5 5',
+      }).addTo(map);
+    }
+    vertices.forEach(([lat, lng], i) => {
+      const m = window.L.circleMarker([lat, lng], {
+        radius: 5, color: 'white', fillColor: '#4A6B5C', fillOpacity: 1, weight: 2,
+      }).bindTooltip(`#${i + 1}`, { permanent: false }).addTo(map);
+      markersRef.current.push(m);
+    });
+  }, [vertices]);
+
+  const selectZone = (zone) => {
+    setSelectedZone(zone);
+    setZoneName(zone.name || '');
+    setZoneDesc(zone.description_public || '');
+    if (zone.polygon_coords && zone.polygon_coords.length >= 3) {
+      setVertices(zone.polygon_coords);
+      if (leafletMapRef.current && window.L) {
+        try { leafletMapRef.current.fitBounds(zone.polygon_coords); } catch (_) {}
+      }
+    }
+    setDrawMode(false);
+  };
+
+  const startNew = () => {
+    setSelectedZone(null);
+    setZoneName('');
+    setZoneDesc('');
+    setVertices([]);
+    setDrawMode(false);
+  };
+
+  const centroid = (coords) => {
+    const n = coords.length;
+    return [coords.reduce((s, c) => s + c[0], 0) / n, coords.reduce((s, c) => s + c[1], 0) / n];
   };
 
   const handleSave = async () => {
-    if (vertices.length < 3) return;
+    if (vertices.length < 3 || !zoneName.trim()) return;
     setSaving(true);
     try {
-      await AnchorAPI.apiPost('/v1/admin/geofence', { vertices });
+      if (selectedZone) {
+        await AnchorAPI.apiPatch(`/v1/admin/campus-zones/${selectedZone.id}`, {
+          name: zoneName.trim(),
+          description: zoneDesc.trim() || null,
+          polygon_coords: vertices,
+        });
+      } else {
+        const [c_lat, c_lng] = centroid(vertices);
+        await AnchorAPI.apiPostAuth('/v1/admin/campus-zones', {
+          name: zoneName.trim(),
+          zone_type: 'campus',
+          shape_type: 'polygon',
+          polygon_coords: vertices,
+          center_lat: c_lat,
+          center_lng: c_lng,
+          description: zoneDesc.trim() || null,
+        });
+      }
       setSaved(true);
-      setGeoInfo({ updated_at: new Date().toISOString(), vertex_count: vertices.length });
       setTimeout(() => setSaved(false), 3000);
+      loadZones();
     } catch (e) {
       console.error('[Geofence] Save failed:', e);
+      alert('Save failed: ' + (e.message || 'Unknown error'));
     } finally {
       setSaving(false);
     }
   };
 
-  const polyPoints = vertices.map(([x, y]) => `${x},${y}`).join(' ');
+  const handleArchive = async (zone, e) => {
+    e.stopPropagation();
+    if (!confirm(`Archive zone "${zone.name}"? It will be removed from the student map.`)) return;
+    try {
+      await AnchorAPI.apiDelete(`/v1/admin/campus-zones/${zone.id}`);
+      if (selectedZone?.id === zone.id) startNew();
+      loadZones();
+    } catch (err) {
+      console.error('[Geofence] Archive failed:', err);
+    }
+  };
 
   return (
     <>
       <PageHeader
         title="Campus geofence"
         bn="ক্যাম্পাস সীমানা"
-        description="Draw your university's safety boundary. Active alerts inside this zone are routed to the Super Admin operations team."
+        description="Draw your university's safety boundary. Saved zones appear on the student map immediately."
         actions={
           <>
+            <GhostButton icon="plus" size="sm" onClick={startNew}>New zone</GhostButton>
             <GhostButton icon={drawMode ? 'pencil-off' : 'pencil'} size="sm" onClick={() => setDrawMode(m => !m)}>
               {drawMode ? 'Done drawing' : 'Draw boundary'}
             </GhostButton>
             {vertices.length > 0 && (
               <GhostButton icon="undo-2" size="sm" onClick={() => setVertices(v => v.slice(0, -1))}>Undo</GhostButton>
             )}
+            <GhostButton icon="trash-2" size="sm" onClick={() => setVertices([])}>Clear</GhostButton>
             <PrimaryButton
               icon="save"
               mode="sage"
               size="sm"
               onClick={handleSave}
-              disabled={saving || vertices.length < 3}
+              disabled={saving || vertices.length < 3 || !zoneName.trim()}
             >
-              {saving ? 'Saving…' : saved ? 'Saved ✓' : 'Save geofence'}
+              {saving ? 'Saving…' : saved ? 'Saved ✓' : selectedZone ? 'Update zone' : 'Save zone'}
             </PrimaryButton>
           </>
         }
       />
 
       <AuditNote tone="navy" icon="shield-check">
-        Campus alerts are operated by the AiVion Trust &amp; Safety team. Your role is to maintain the geofence boundary — alerts that fire inside this area are routed to platform operators in real time.
+        Campus zones appear on the student safety map as green highlighted areas. Active alerts inside a zone are routed to platform operators in real time.
       </AuditNote>
 
-      <div className="grid gap-5 mt-5" style={{ gridTemplateColumns: '1fr 320px' }}>
-        <Card noPad>
-          <div className="p-4 hair-b flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <Icon name="map-pin" size={14} />
-              <span className="font-medium text-[13.5px]">Boundary editor</span>
-              {drawMode
-                ? <span className="text-[12px]" style={{ color: 'var(--sage)' }}>Click canvas to place vertices</span>
-                : <span className="text-[12px] text-[var(--muted)]">Click "Draw boundary" to start placing vertices</span>
-              }
-            </div>
-            <GhostButton size="sm" icon="trash-2" onClick={() => setVertices([])}>Clear</GhostButton>
-          </div>
-
-          <div style={{ padding: '16px' }}>
-            <svg
-              viewBox="0 0 400 200"
-              style={{
-                width: '100%', height: 'auto', background: '#F5F5F2',
-                borderRadius: 4, cursor: drawMode ? 'crosshair' : 'default',
-                border: '1px solid var(--hair)',
-              }}
-              onClick={handleSvgClick}
+      <div className="flex gap-4 mt-5" style={{ height: 'calc(100vh - 220px)', minHeight: 420 }}>
+        {/* Leaflet map */}
+        <div className="flex-1 rounded-sm border hair relative" style={{ minWidth: 0 }}>
+          {drawMode && (
+            <div
+              className="absolute top-3 z-[1000] px-3 py-1.5 rounded text-[12px] font-medium flex items-center gap-2"
+              style={{ left: '50%', transform: 'translateX(-50%)', background: 'var(--sage)', color: 'white', boxShadow: 'var(--shadow)', pointerEvents: 'all' }}
             >
-              <defs>
-                <pattern id="gfgrid" width="40" height="40" patternUnits="userSpaceOnUse">
-                  <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#E8E8E4" strokeWidth="0.5" />
-                </pattern>
-              </defs>
-              <rect width="400" height="200" fill="url(#gfgrid)" />
-              <text x="200" y="106" textAnchor="middle" fontSize="9" fill="#BDBDB8" fontFamily="JetBrains Mono">Campus boundary canvas · 400 × 200</text>
-              {vertices.length >= 2 && (
-                <polygon points={polyPoints} fill="rgba(74,107,92,0.1)" stroke="#4A6B5C" strokeWidth="1.5" strokeDasharray="4 3" />
-              )}
-              {vertices.map(([x, y], i) => (
-                <circle key={i} cx={x} cy={y} r={4} fill="#4A6B5C" stroke="white" strokeWidth="1.5" style={{ cursor: 'grab' }} />
-              ))}
-            </svg>
-          </div>
+              <Icon name="map-pin" size={13} />
+              Click map to place boundary vertices
+              <button onClick={() => setDrawMode(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 0, opacity: 0.8, display: 'flex' }}>
+                <Icon name="x" size={12} />
+              </button>
+            </div>
+          )}
+          {mapError ? (
+            <div className="w-full h-full flex flex-col items-center justify-center p-6 text-center" style={{ background: 'var(--mist)' }}>
+              <Icon name="map-off" size={32} className="mb-3 text-[var(--muted)]" />
+              <p className="text-[13px] text-[var(--graphite)]">{mapError}</p>
+            </div>
+          ) : (
+            <div ref={mapDivRef} className="w-full h-full" style={{ cursor: drawMode ? 'crosshair' : undefined }} />
+          )}
+        </div>
 
-          <div className="p-3 hair-t flex items-center justify-between text-[12px] text-[var(--muted)]">
-            <span><span className="font-mono text-[var(--ink)]">{vertices.length}</span> vertices</span>
-            {geoInfo?.updated_at && (
-              <span>Last saved <span className="font-mono">{geoInfo.updated_at.slice(0, 10)}</span></span>
-            )}
-          </div>
-        </Card>
-
-        <div className="flex flex-col gap-4">
+        {/* Right panel */}
+        <div className="flex flex-col gap-4 overflow-y-auto" style={{ width: 280, flexShrink: 0 }}>
           <Card>
-            <SectionLabel>Geofence status</SectionLabel>
-            <div className="space-y-2.5">
-              <div className="flex items-center justify-between text-[12.5px]">
-                <span className="text-[var(--muted)]">Status</span>
-                <StatusPill status={vertices.length >= 3 ? 'Active' : 'Submitted'} />
+            <SectionLabel>{selectedZone ? 'Edit zone' : 'New zone'}</SectionLabel>
+            <div className="space-y-3">
+              <div>
+                <label className="block text-[11px] font-medium mb-1" style={{ color: 'var(--muted)' }}>Zone name *</label>
+                <input
+                  type="text"
+                  value={zoneName}
+                  onChange={e => setZoneName(e.target.value)}
+                  placeholder="e.g. Main Campus"
+                  maxLength={200}
+                  style={{ width: '100%', padding: '6px 10px', borderRadius: 4, border: '1px solid var(--mist)', background: 'var(--cream)', fontSize: 12.5, outline: 'none', boxSizing: 'border-box' }}
+                />
               </div>
-              <div className="flex items-center justify-between text-[12.5px]">
-                <span className="text-[var(--muted)]">Vertices</span>
+              <div>
+                <label className="block text-[11px] font-medium mb-1" style={{ color: 'var(--muted)' }}>Description</label>
+                <textarea
+                  value={zoneDesc}
+                  onChange={e => setZoneDesc(e.target.value)}
+                  placeholder="Visible to students on the map…"
+                  rows={3}
+                  maxLength={2000}
+                  style={{ width: '100%', padding: '6px 10px', borderRadius: 4, border: '1px solid var(--mist)', background: 'var(--cream)', fontSize: 12.5, outline: 'none', resize: 'none', boxSizing: 'border-box' }}
+                />
+              </div>
+              <div className="flex items-center justify-between" style={{ fontSize: 12 }}>
+                <span style={{ color: 'var(--muted)' }}>Vertices placed</span>
                 <span className="font-mono">{vertices.length}</span>
               </div>
-              {geoInfo?.updated_at && (
-                <div className="flex items-center justify-between text-[12.5px]">
-                  <span className="text-[var(--muted)]">Last saved</span>
-                  <span className="font-mono">{geoInfo.updated_at.slice(0, 10)}</span>
-                </div>
+              {!zoneName.trim() && vertices.length >= 3 && (
+                <p style={{ fontSize: 11, color: 'var(--ember)' }}>Zone name is required to save.</p>
               )}
             </div>
           </Card>
 
           <Card>
+            <SectionLabel right={<MonoChip>{zones.length}</MonoChip>}>Campus zones</SectionLabel>
+            {zones.length === 0 ? (
+              <div style={{ fontSize: 12, color: 'var(--muted)', textAlign: 'center', padding: '8px 0' }}>No zones saved yet</div>
+            ) : zones.map(z => (
+              <div
+                key={z.id}
+                onClick={() => selectZone(z)}
+                style={{
+                  display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start',
+                  margin: '0 -12px', padding: '8px 12px', borderBottom: '1px solid var(--mist)',
+                  cursor: 'pointer', borderRadius: 4,
+                  background: selectedZone?.id === z.id ? 'rgba(74,107,92,0.08)' : 'transparent',
+                }}
+              >
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#4A6B5C', flexShrink: 0 }} />
+                    <span style={{ fontSize: 12.5, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{z.name}</span>
+                  </div>
+                  {z.description_public && (
+                    <p style={{ fontSize: 11, color: 'var(--muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', margin: '2px 0 0 14px' }}>{z.description_public}</p>
+                  )}
+                  <p style={{ fontSize: 11, color: 'var(--muted)', margin: '1px 0 0 14px' }}>
+                    {(z.polygon_coords?.length ?? 0)} vertices
+                  </p>
+                </div>
+                <button
+                  onClick={(ev) => handleArchive(z, ev)}
+                  title="Archive zone"
+                  style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 2, opacity: 0.4, display: 'flex', flexShrink: 0, marginLeft: 8 }}
+                  onMouseEnter={e => e.currentTarget.style.opacity = 1}
+                  onMouseLeave={e => e.currentTarget.style.opacity = 0.4}
+                >
+                  <Icon name="archive" size={13} />
+                </button>
+              </div>
+            ))}
+          </Card>
+
+          <Card>
             <SectionLabel>Recent alerts inside zone</SectionLabel>
             {recentAlerts.length === 0 ? (
-              <div className="text-[12px] text-[var(--muted)] text-center py-2">No active alerts</div>
+              <div style={{ fontSize: 12, color: 'var(--muted)', textAlign: 'center', padding: '8px 0' }}>No active alerts</div>
             ) : recentAlerts.map(ev => (
               <div key={ev.event_id} className="flex justify-between items-center text-[12.5px] py-1.5 hair-b last:border-0">
                 <span className="font-mono text-[var(--muted)]">{ev.event_id.slice(0, 8)}…</span>
