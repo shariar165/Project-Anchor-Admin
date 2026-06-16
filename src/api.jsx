@@ -113,7 +113,25 @@ const AnchorAPI = (() => {
     }]);
   }
 
-  return { getAccessToken, getRefreshToken, setTokens, getStoredUser, setStoredUser, clearAuth, apiPost, apiGet, apiPostAuth, apiPatch, apiDelete };
+  // Authenticated GET that returns a Blob (for CSV / file downloads).
+  // Mirrors _fetch's 401→refresh-once behaviour but does NOT parse JSON.
+  async function apiGetBlob(path, retried = false) {
+    const res = await fetch(BASE + path, { headers: _authHeaders() });
+    if (res.status === 401 && !retried) {
+      const ok = await _tryRefresh();
+      if (ok) return apiGetBlob(path, true);
+      clearAuth();
+      throw new Error('Session expired — please log in again');
+    }
+    if (!res.ok) {
+      let detail = 'Download failed';
+      try { detail = (await res.json()).detail || detail; } catch { /* non-JSON error body */ }
+      throw new Error(detail);
+    }
+    return res.blob();
+  }
+
+  return { getAccessToken, getRefreshToken, setTokens, getStoredUser, setStoredUser, clearAuth, apiPost, apiGet, apiPostAuth, apiPatch, apiDelete, apiGetBlob };
 })();
 
 Object.assign(window, { AnchorAPI });

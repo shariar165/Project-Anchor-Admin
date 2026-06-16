@@ -233,65 +233,213 @@ function SuperTenantDetail({ id, onGo }) {
 }
 
 // ---- Audit Logs ----
+const AUDIT_ACTION_PREFIXES = [
+  { v: '',             label: 'All actions' },
+  { v: 'alert_',       label: 'Alerts' },
+  { v: 'zone_',        label: 'Zones' },
+  { v: 'campus_zone_', label: 'Campus zones' },
+  { v: 'super_zone_',  label: 'Super zones' },
+  { v: 'feed_',        label: 'Feed' },
+  { v: 'token_',       label: 'Auth / tokens' },
+];
+const AUDIT_ROLES = ['', 'student', 'user', 'moderator', 'admin', 'super_admin'];
+const AUDIT_WINDOWS = [
+  { v: '24h', label: 'Last 24h' },
+  { v: '7d',  label: 'Last 7 days' },
+  { v: '30d', label: 'Last 30 days' },
+  { v: '',    label: 'All time' },
+];
+const PAGE_SIZE = 50;
+
+function _windowToDateFrom(win) {
+  const ms = { '24h': 864e5, '7d': 7 * 864e5, '30d': 30 * 864e5 }[win];
+  return ms ? new Date(Date.now() - ms).toISOString() : '';
+}
+
 function SuperAuditLogs() {
-  const D = window.AnchorData;
+  const [rows, setRows] = useState([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
   const [selected, setSelected] = useState(null);
+
+  // Filters
   const [q, setQ] = useState('');
-  const rows = useMemo(() => D.audit.filter(a => !q || JSON.stringify(a).toLowerCase().includes(q.toLowerCase())), [q]);
+  const [qDebounced, setQDebounced] = useState('');
+  const [prefix, setPrefix] = useState('');
+  const [role, setRole] = useState('');
+  const [win, setWin] = useState('7d');
+
+  // Integrity verify + export
+  const [verifying, setVerifying] = useState(false);
+  const [verifyResult, setVerifyResult] = useState(null);
+  const [exporting, setExporting] = useState(false);
+
+  // Debounce the search box
+  useEffect(() => {
+    const id = setTimeout(() => setQDebounced(q.trim()), 350);
+    return () => clearTimeout(id);
+  }, [q]);
+
+  // Reset to page 1 whenever a filter changes
+  useEffect(() => { setPage(1); }, [qDebounced, prefix, role, win]);
+
+  const buildParams = useCallback((extra = {}) => {
+    const p = new URLSearchParams();
+    if (qDebounced) p.set('q', qDebounced);
+    if (prefix) p.set('prefix', prefix);
+    if (role) p.set('role', role);
+    const df = _windowToDateFrom(win);
+    if (df) p.set('date_from', df);
+    Object.entries(extra).forEach(([k, v]) => p.set(k, v));
+    return p;
+  }, [qDebounced, prefix, role, win]);
+
+  const load = useCallback(() => {
+    setLoading(true); setError('');
+    const params = buildParams({ limit: PAGE_SIZE, offset: (page - 1) * PAGE_SIZE });
+    AnchorAPI.apiGet(`/v1/admin/audit?${params}`)
+      .then(d => { setRows(d.items || []); setTotal(d.total || 0); setLoading(false); })
+      .catch(e => { setError(e.message || 'Failed to load audit log'); setLoading(false); });
+  }, [buildParams, page]);
+
+  useEffect(() => { load(); }, [load]);
+
+  async function handleVerify() {
+    setVerifying(true); setVerifyResult(null);
+    try {
+      const r = await AnchorAPI.apiGet('/v1/admin/audit/verify?limit=1000');
+      setVerifyResult(r);
+    } catch (e) {
+      setVerifyResult({ _error: e.message || 'Verification failed' });
+    } finally {
+      setVerifying(false);
+    }
+  }
+
+  async function handleExport() {
+    setExporting(true);
+    try {
+      const params = buildParams({ limit: 5000 });
+      const blob = await AnchorAPI.apiGetBlob(`/v1/admin/audit/export?${params}`);
+      downloadBlob(blob, `anchor-audit-${new Date().toISOString().slice(0,10)}.csv`);
+    } catch (e) {
+      setError(e.message || 'Export failed');
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+
   return (
     <>
       <PageHeader
         title="Audit log explorer"
-        description="Every significant action across the platform is permanently logged. Logs cannot be edited or deleted."
-        actions={<GhostButton icon="download" size="sm">Export CSV (watermarked)</GhostButton>}
+        description="Every significant action across the platform is permanently logged in an append-only, SHA-256 hash-chained ledger. Logs cannot be edited or deleted."
+        actions={
+          <>
+            <GhostButton icon="shield-check" size="sm" disabled={verifying} onClick={handleVerify}>
+              {verifying ? 'Verifying…' : 'Verify chain'}
+            </GhostButton>
+            <GhostButton icon="download" size="sm" disabled={exporting} onClick={handleExport}>
+              {exporting ? 'Exporting…' : 'Export CSV (watermarked)'}
+            </GhostButton>
+          </>
+        }
       />
 
+      {verifyResult && (
+        <AuditNote tone={verifyResult._error ? 'red' : (verifyResult.ok ? 'sage' : 'red')} icon={verifyResult.ok ? 'shield-check' : 'shield-alert'} className="mb-3">
+          {verifyResult._error
+            ? `Verification failed: ${verifyResult._error}`
+            : verifyResult.ok
+              ? `Chain intact — ${verifyResult.checked} most-recent rows verified against their SHA-256 hashes.`
+              : `Tampering detected. The chain breaks at audit row ${verifyResult.first_tampered_id} (checked ${verifyResult.checked} rows).`}
+        </AuditNote>
+      )}
+
       <Card noPad className="mb-4">
-        <div className="p-4 grid gap-3 hair-b" style={{ gridTemplateColumns:'2fr 1fr 1fr 1fr 1fr' }}>
+        <div className="p-4 grid gap-3 hair-b" style={{ gridTemplateColumns:'2fr 1fr 1fr 1fr' }}>
           <div className="flex items-center gap-2 hair border rounded-sm px-2 bg-white">
             <Icon name="search" size={14} className="text-[var(--muted)]" />
-            <input value={q} onChange={e=>setQ(e.target.value)} placeholder="Filter by actor, action, target, IP…" className="flex-1 py-2 outline-none bg-transparent text-[13px]" />
+            <input value={q} onChange={e=>setQ(e.target.value)} placeholder="Search action or metadata…" className="flex-1 py-2 outline-none bg-transparent text-[13px]" />
           </div>
-          <select className="hair border rounded-sm px-2 py-2 bg-white text-[12.5px]"><option>All actions</option><option>COMPLAINT_*</option><option>DEANONYMIZE_*</option><option>ALERT_*</option><option>LOGIN</option></select>
-          <select className="hair border rounded-sm px-2 py-2 bg-white text-[12.5px]"><option>All roles</option><option>Department Head</option><option>Dean</option><option>Proctor</option><option>Super Admin</option></select>
-          <select className="hair border rounded-sm px-2 py-2 bg-white text-[12.5px]"><option>All tenants</option><option>DIU</option><option>BUET</option><option>DU</option><option>NSU</option></select>
-          <select className="hair border rounded-sm px-2 py-2 bg-white text-[12.5px]"><option>Last 24h</option><option>Last 7 days</option><option>Last 30 days</option><option>All time</option></select>
+          <select value={prefix} onChange={e=>setPrefix(e.target.value)} className="hair border rounded-sm px-2 py-2 bg-white text-[12.5px]">
+            {AUDIT_ACTION_PREFIXES.map(o => <option key={o.v} value={o.v}>{o.label}</option>)}
+          </select>
+          <select value={role} onChange={e=>setRole(e.target.value)} className="hair border rounded-sm px-2 py-2 bg-white text-[12.5px]">
+            {AUDIT_ROLES.map(r => <option key={r} value={r}>{r ? r.replace('_',' ') : 'All roles'}</option>)}
+          </select>
+          <select value={win} onChange={e=>setWin(e.target.value)} className="hair border rounded-sm px-2 py-2 bg-white text-[12.5px]">
+            {AUDIT_WINDOWS.map(o => <option key={o.v} value={o.v}>{o.label}</option>)}
+          </select>
         </div>
-        <DataTable
-          columns={[
-            { key:'t', label:'Timestamp', render:r=><span className="font-mono text-[11.5px] text-[var(--muted)]">{r.t}</span> },
-            { key:'actor', label:'Actor (masked)' },
-            { key:'action', label:'Action', render:r=><MonoChip>{r.action}</MonoChip> },
-            { key:'target', label:'Target', render:r=><span className="font-mono text-[11.5px]">{r.target}</span> },
-            { key:'tenant', label:'Tenant', render:r=><Tag tone="navy">{r.tenant}</Tag> },
-            { key:'ip', label:'IP', render:r=><span className="font-mono text-[11.5px]">{r.ip}</span> },
-            { key:'outcome', label:'Outcome', render:r=><span className="text-[12px]">{r.outcome}</span> },
-          ]}
-          rows={rows}
-          dense
-          onRowClick={setSelected}
-        />
+
+        {loading && (
+          <div className="p-6 space-y-3">
+            {[1,2,3,4].map(i => <div key={i} className="h-6 bg-[var(--mist)] rounded-sm animate-pulse" />)}
+          </div>
+        )}
+        {!loading && error && (
+          <div className="p-4 text-[13px]" style={{ color:'var(--red)' }}>
+            {error} — <button className="underline" onClick={load}>Retry</button>
+          </div>
+        )}
+        {!loading && !error && (
+          <DataTable
+            columns={[
+              { key:'created_at', label:'Timestamp', render:r=><span className="font-mono text-[11.5px] text-[var(--muted)]">{new Date(r.created_at).toLocaleString()}</span> },
+              { key:'actor', label:'Actor (masked)', render:r=><span className="font-mono text-[11.5px]">{r.actor.masked_email}</span> },
+              { key:'role', label:'Role', render:r=> r.actor.role ? <Tag tone="navy">{r.actor.role.replace('_',' ')}</Tag> : <span className="text-[var(--muted)] text-[11px]">—</span> },
+              { key:'event_type', label:'Action', render:r=><MonoChip>{r.event_type}</MonoChip> },
+              { key:'ip_address', label:'IP', render:r=><span className="font-mono text-[11.5px]">{r.ip_address || '—'}</span> },
+            ]}
+            rows={rows}
+            dense
+            onRowClick={setSelected}
+          />
+        )}
+        {!loading && !error && rows.length === 0 && (
+          <div className="p-8 text-center text-[13px] text-[var(--muted)]">No audit events match these filters.</div>
+        )}
       </Card>
 
-      <SlideOver open={!!selected} onClose={()=>setSelected(null)} width={520}>
+      {total > PAGE_SIZE && (
+        <div className="flex items-center gap-2 mb-4 justify-end">
+          <GhostButton size="sm" icon="chevron-left" onClick={() => setPage(p => Math.max(1, p-1))} disabled={page===1}>Prev</GhostButton>
+          <span className="text-[12px] text-[var(--muted)]">Page {page} / {totalPages} · {total} events</span>
+          <GhostButton size="sm" icon="chevron-right" onClick={() => setPage(p => Math.min(totalPages, p+1))} disabled={page>=totalPages}>Next</GhostButton>
+        </div>
+      )}
+
+      <SlideOver open={!!selected} onClose={()=>setSelected(null)} width={560}>
         {selected && (
           <div className="p-5 space-y-3">
             <div className="flex items-center justify-between">
               <SectionLabel className="mb-0">Audit event</SectionLabel>
               <button onClick={()=>setSelected(null)} className="w-7 h-7 rounded-sm hover:bg-[var(--mist)]/40 flex items-center justify-center"><Icon name="x" size={14} /></button>
             </div>
-            <MonoChip tone="navy">{selected.action}</MonoChip>
-            <div className="hair border rounded-sm p-3 bg-[#FBF9F2] font-mono text-[12px] space-y-1">
-              <div><span className="text-[var(--muted)]">timestamp:</span> {selected.t}</div>
-              <div><span className="text-[var(--muted)]">actor:</span> {selected.actor}</div>
-              <div><span className="text-[var(--muted)]">target:</span> {selected.target}</div>
-              <div><span className="text-[var(--muted)]">tenant:</span> {selected.tenant}</div>
-              <div><span className="text-[var(--muted)]">ip:</span> {selected.ip}</div>
-              <div><span className="text-[var(--muted)]">outcome:</span> {selected.outcome}</div>
-              <div><span className="text-[var(--muted)]">hash:</span> 0x{Math.random().toString(16).slice(2, 18)}</div>
+            <MonoChip tone="navy">{selected.event_type}</MonoChip>
+            <div className="hair border rounded-sm p-3 bg-[#FBF9F2] font-mono text-[12px] space-y-1 break-all">
+              <div><span className="text-[var(--muted)]">timestamp:</span> {new Date(selected.created_at).toLocaleString()}</div>
+              <div><span className="text-[var(--muted)]">actor:</span> {selected.actor.masked_email}</div>
+              <div><span className="text-[var(--muted)]">role:</span> {selected.actor.role || '—'}</div>
+              <div><span className="text-[var(--muted)]">user_id:</span> {selected.actor.user_id || '—'}</div>
+              <div><span className="text-[var(--muted)]">tenant_id:</span> {selected.actor.tenant_id || '—'}</div>
+              <div><span className="text-[var(--muted)]">ip:</span> {selected.ip_address || '—'}</div>
+            </div>
+            <SectionLabel className="mb-0">Metadata</SectionLabel>
+            <pre className="hair border rounded-sm p-3 bg-white font-mono text-[11.5px] whitespace-pre-wrap break-all max-h-60 overflow-y-auto">
+              {JSON.stringify(selected.metadata || {}, null, 2)}
+            </pre>
+            <SectionLabel className="mb-0">Row hash (SHA-256)</SectionLabel>
+            <div className="hair border rounded-sm p-3 bg-[#FBF9F2] font-mono text-[11px] break-all">
+              {selected.row_hash}
             </div>
             <AuditNote tone="navy" icon="shield-check">
-              This event is part of an append-only Merkle-chained log. Tampering would invalidate downstream hashes.
+              This event is one link in an append-only SHA-256 hash chain. Editing any field invalidates this and every downstream hash — use “Verify chain” to re-check integrity.
             </AuditNote>
           </div>
         )}
@@ -678,6 +826,24 @@ const ALERT_STATE_LABEL = {
   resolved:    'Resolved',
 };
 
+// Trigger a browser download for a Blob returned by AnchorAPI.apiGetBlob.
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+const ALERT_ADMIN_ACTION_LABEL = {
+  dispatch:          'Response dispatched',
+  notify_university: 'University notified',
+  anonymous_call:    'Anonymous call',
+};
+
 function SuperAlerts({ onGo }) {
   const [tab, setTab] = useState('active');
   const [alerts, setAlerts] = useState([]);
@@ -695,6 +861,8 @@ function SuperAlerts({ onGo }) {
   const [actionMsg, setActionMsg] = useState({});
   const [confirmAction, setConfirmAction] = useState(null);
   const [now, setNow] = useState(Date.now());
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState('');
 
   // Live clock for elapsed display on active tab
   useEffect(() => {
@@ -702,6 +870,14 @@ function SuperAlerts({ onGo }) {
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
   }, [tab]);
+
+  // Live data refresh for the active tab — a safety console should not show
+  // stale alerts. Polls list + stats every 15s; paused on other tabs.
+  useEffect(() => {
+    if (tab !== 'active') return;
+    const id = setInterval(() => { loadAlerts(); loadStats(); }, 15000);
+    return () => clearInterval(id);
+  }, [tab, page, histState]);
 
   function loadAlerts() {
     if (tab === 'analytics') return;
@@ -728,11 +904,26 @@ function SuperAlerts({ onGo }) {
     if (tab === 'active' || tab === 'analytics') loadStats();
   }, [tab, page, histState]);
 
+  // Re-fetch the open detail slide-over (if any) so it never shows stale state
+  // after an action. Returns the refreshed detail or null.
+  async function refreshDetail(eventId) {
+    if (!eventId || selected !== eventId) return null;
+    try {
+      const d = await AnchorAPI.apiGet(`/v1/admin/alerts/${eventId}`);
+      setDetail(d);
+      return d;
+    } catch (e) {
+      setDetail({ _error: e.message || 'Could not reload alert detail' });
+      return null;
+    }
+  }
+
   async function handleAck(eventId) {
     setActionLoading(a => ({ ...a, [eventId]: 'ack' }));
     try {
       await AnchorAPI.apiPostAuth(`/v1/admin/alerts/${eventId}/ack`, {});
       setActionMsg(m => ({ ...m, [eventId]: 'Acknowledged' }));
+      await refreshDetail(eventId);
     } catch (e) {
       setActionMsg(m => ({ ...m, [eventId]: e.message || 'Failed' }));
     } finally {
@@ -746,6 +937,7 @@ function SuperAlerts({ onGo }) {
       await AnchorAPI.apiPostAuth(`/v1/admin/alerts/${eventId}/resolve`, {});
       setConfirmAction(null);
       loadAlerts();
+      await refreshDetail(eventId);
     } catch (e) {
       setActionMsg(m => ({ ...m, [eventId]: e.message || 'Resolve failed' }));
       setConfirmAction(null);
@@ -760,11 +952,42 @@ function SuperAlerts({ onGo }) {
       await AnchorAPI.apiPostAuth(`/v1/admin/alerts/${eventId}/false`, {});
       setConfirmAction(null);
       loadAlerts();
+      await refreshDetail(eventId);
     } catch (e) {
       setActionMsg(m => ({ ...m, [eventId]: e.message || 'Failed' }));
       setConfirmAction(null);
     } finally {
       setActionLoading(a => ({ ...a, [eventId]: null }));
+    }
+  }
+
+  // Generic admin-action handler for dispatch / notify-university / anonymous-call.
+  async function handleAction(eventId, kind, endpoint, successMsg) {
+    setActionLoading(a => ({ ...a, [eventId]: kind }));
+    try {
+      await AnchorAPI.apiPostAuth(`/v1/admin/alerts/${eventId}/${endpoint}`, {});
+      setActionMsg(m => ({ ...m, [eventId]: successMsg }));
+      await refreshDetail(eventId);
+    } catch (e) {
+      setActionMsg(m => ({ ...m, [eventId]: e.message || 'Action failed' }));
+    } finally {
+      setActionLoading(a => ({ ...a, [eventId]: null }));
+    }
+  }
+
+  const handleDispatch = (id) => handleAction(id, 'dispatch', 'dispatch', 'Response dispatched');
+  const handleNotify   = (id) => handleAction(id, 'notify', 'notify-university', 'University notified');
+  const handleCall     = (id) => handleAction(id, 'call', 'anonymous-call', 'Anonymous call initiated');
+
+  async function handleExport() {
+    setExporting(true); setExportError('');
+    try {
+      const blob = await AnchorAPI.apiGetBlob('/v1/admin/alerts/export?window=24h');
+      downloadBlob(blob, `anchor-alerts-24h-${new Date().toISOString().slice(0,10)}.csv`);
+    } catch (e) {
+      setExportError(e.message || 'Export failed');
+    } finally {
+      setExporting(false);
     }
   }
 
@@ -798,10 +1021,15 @@ function SuperAlerts({ onGo }) {
         actions={
           <>
             <span className="text-[12.5px] text-[var(--muted)] px-2">Cross-tenant view</span>
-            <GhostButton size="sm" icon="download">Export 24h log</GhostButton>
+            <GhostButton size="sm" icon="download" disabled={exporting} onClick={handleExport}>
+              {exporting ? 'Exporting…' : 'Export 24h log'}
+            </GhostButton>
           </>
         }
       />
+      {exportError && (
+        <div className="mb-3 text-[12.5px]" style={{ color:'var(--red)' }}>{exportError}</div>
+      )}
 
       <AuditNote tone="red" icon="shield-alert" className="mb-4">
         Alert event data is stored with anonymous event IDs only. Identity de-anonymization is a separate workflow and requires formal legal grounds.
@@ -880,9 +1108,21 @@ function SuperAlerts({ onGo }) {
                           onClick={() => handleAck(a.event_id)}>
                           {actionLoading[a.event_id] === 'ack' ? '…' : 'Acknowledge'}
                         </PrimaryButton>
-                        <PrimaryButton size="sm" mode="navy" icon="users">Dispatch response</PrimaryButton>
-                        <GhostButton size="sm" icon="phone">Anonymous call</GhostButton>
-                        <GhostButton size="sm" icon="building-2">Notify university</GhostButton>
+                        <PrimaryButton size="sm" mode="navy" icon="users"
+                          disabled={!!actionLoading[a.event_id]}
+                          onClick={() => handleDispatch(a.event_id)}>
+                          {actionLoading[a.event_id] === 'dispatch' ? '…' : 'Dispatch response'}
+                        </PrimaryButton>
+                        <GhostButton size="sm" icon="phone"
+                          disabled={!!actionLoading[a.event_id]}
+                          onClick={() => handleCall(a.event_id)}>
+                          {actionLoading[a.event_id] === 'call' ? '…' : 'Anonymous call'}
+                        </GhostButton>
+                        <GhostButton size="sm" icon="building-2"
+                          disabled={!!actionLoading[a.event_id]}
+                          onClick={() => handleNotify(a.event_id)}>
+                          {actionLoading[a.event_id] === 'notify' ? '…' : 'Notify university'}
+                        </GhostButton>
                         <GhostButton size="sm" icon="check-circle"
                           disabled={!!actionLoading[a.event_id]}
                           onClick={() => setConfirmAction({ type: 'resolve', eventId: a.event_id })}>
@@ -1157,8 +1397,47 @@ function SuperAlerts({ onGo }) {
               </>
             )}
 
+            {/* Proctor/admin actions taken on this alert */}
+            <div className="flex items-center gap-2">
+              <SectionLabel className="mb-0">Console actions{detail.admin_actions ? ` (${detail.admin_actions.length})` : ''}</SectionLabel>
+              {detail.acked && <Tag tone="sage">acknowledged</Tag>}
+            </div>
+            {detail.admin_actions && detail.admin_actions.length > 0 ? (
+              <div className="space-y-1.5">
+                {detail.admin_actions.map((aa, i) => (
+                  <div key={i} className="hair border rounded-sm px-3 py-2 text-[12px] flex items-center gap-2">
+                    <Tag tone="navy">{ALERT_ADMIN_ACTION_LABEL[aa.action_type] || aa.action_type}</Tag>
+                    <span className="text-[var(--muted)]">{aa.actor}</span>
+                    {aa.note && <span className="text-[var(--ink)] truncate">· {aa.note}</span>}
+                    <span className="ml-auto font-mono text-[10.5px] text-[var(--muted)]">{new Date(aa.created_at).toLocaleTimeString()}</span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-[11.5px] text-[var(--muted)]">No console actions recorded yet.</div>
+            )}
+
+            {actionMsg[detail.event_id] && (
+              <div className="text-[12px]" style={{ color: 'var(--sage)' }}>{actionMsg[detail.event_id]}</div>
+            )}
+
             {detail.state === 'active' && (
-              <div className="flex gap-2 pt-2">
+              <div className="flex flex-wrap gap-2 pt-2">
+                <PrimaryButton mode="navy" icon="users" size="sm"
+                  disabled={!!actionLoading[detail.event_id]}
+                  onClick={() => handleDispatch(detail.event_id)}>
+                  {actionLoading[detail.event_id] === 'dispatch' ? '…' : 'Dispatch'}
+                </PrimaryButton>
+                <GhostButton icon="building-2" size="sm"
+                  disabled={!!actionLoading[detail.event_id]}
+                  onClick={() => handleNotify(detail.event_id)}>
+                  {actionLoading[detail.event_id] === 'notify' ? '…' : 'Notify university'}
+                </GhostButton>
+                <GhostButton icon="phone" size="sm"
+                  disabled={!!actionLoading[detail.event_id]}
+                  onClick={() => handleCall(detail.event_id)}>
+                  {actionLoading[detail.event_id] === 'call' ? '…' : 'Anonymous call'}
+                </GhostButton>
                 <PrimaryButton mode="ember" icon="check-circle" size="sm"
                   disabled={!!actionLoading[detail.event_id]}
                   onClick={() => setConfirmAction({ type: 'resolve', eventId: detail.event_id })}>
@@ -1610,6 +1889,8 @@ function SuperRedZones({ onGo }) {
         maxZoom: 19,
       }).addTo(map);
       leafletMapRef.current = map;
+      // Fix black tiles — container may not have final size at mount time
+      setTimeout(() => map.invalidateSize(), 100);
 
       map.on('click', (e) => {
         if (!clickModeRef.current) return;
